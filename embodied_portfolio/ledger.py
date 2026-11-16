@@ -110,30 +110,41 @@ class Ledger:
             old = self.latest_document(kind, key)
             if old and old["digest"] == content_hash:
                 return old
+            if kind == "notice" and old is not None:
+                raise PortfolioError("notice_immutable", "a notice is recorded once and cannot be revised")
             revision = old["revision"] + 1 if old else 1
             cursor = self.db.execute("INSERT INTO documents(kind,key,revision,digest,body,received_at) "
                                      "VALUES(?,?,?,?,?,?)", (kind, key, revision, content_hash, content, timestamp()))
             self.event("import_" + kind, key, {"revision": revision, "digest": content_hash})
             return self.document(cursor.lastrowid)
 
-    def insert_documents(self, entries: list[tuple[str, str, dict[str, Any]]]) -> list[dict[str, Any]]:
-        """供应商交付的一组修订要么全部提交，要么全部不提交。"""
+    def insert_documents(self, entries: list[tuple[str, str, dict[str, Any]]],
+                         prepare: Any = None) -> list[dict[str, Any]]:
+        """供应商交付的一组修订要么全部提交，要么全部不提交。
+
+        prepare(kind, key, body) 可在写入前补充派生字段；它在事务内顺序执行，
+        因此批次中靠前的报价修订对后续通知可见。任一校验失败则整批回滚。
+        """
         if not entries:
             raise PortfolioError("empty_batch", "batch requires documents")
         identities = [(kind, key) for kind, key, _ in entries]
         if len(set(identities)) != len(identities):
             raise PortfolioError("duplicate_batch_key", "batch repeats a document key")
-        if any(kind not in {"offer", "requirement"} for kind, _, _ in entries):
+        if any(kind not in {"offer", "requirement", "notice"} for kind, _, _ in entries):
             raise PortfolioError("document_kind", "batch contains unknown document kind")
         results = []
         with self.transaction():
             for kind, key, body in entries:
+                if prepare is not None:
+                    body = prepare(kind, key, body)
                 content = canonical(body)
                 content_hash = sha256(content.encode("utf-8")).hexdigest()
                 old = self.latest_document(kind, key)
                 if old and old["digest"] == content_hash:
                     results.append({**old, "changed": False})
                     continue
+                if kind == "notice" and old is not None:
+                    raise PortfolioError("notice_immutable", "a notice is recorded once and cannot be revised")
                 revision = old["revision"] + 1 if old else 1
                 cursor = self.db.execute(
                     "INSERT INTO documents(kind,key,revision,digest,body,received_at) VALUES(?,?,?,?,?,?)",
@@ -158,8 +169,10 @@ class Ledger:
         return [{**dict(row), "report": json.loads(row["report"])} for row in rows]
 
     def insert_analysis(self, requirement: dict[str, Any], offer_docs: list[dict[str, Any]],
-                        report: dict[str, Any]) -> dict[str, Any]:
-        input_refs = [(item["id"], item["digest"]) for item in [requirement, *offer_docs]]
+                        report: dict[str, Any],
+                        notice_docs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        inputs = [requirement, *offer_docs, *(notice_docs or [])]
+        input_refs = [(item["id"], item["digest"]) for item in inputs]
         input_hash = digest(input_refs)
         report_hash = digest(report)
         with self.transaction():
@@ -175,7 +188,8 @@ class Ledger:
 
     def analysis_inputs(self, analysis_id: int) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT d.* FROM documents d JOIN analysis_inputs a ON a.document_id=d.id "
-                               "WHERE a.analysis_id=? ORDER BY CASE d.kind WHEN 'requirement' THEN 0 ELSE 1 END,d.key", (analysis_id,))
+                               "WHERE a.analysis_id=? ORDER BY CASE d.kind WHEN 'requirement' THEN 0 "
+                               "WHEN 'offer' THEN 1 ELSE 2 END,d.key", (analysis_id,))
         return [self._document(row) for row in rows]
 
     def latest_input_digest(self, requirement_key: str) -> str:
@@ -183,7 +197,8 @@ class Ledger:
         if not requirement:
             raise PortfolioError("missing_requirement", "requirement not found")
         offers = self.documents("offer")
-        return digest([(doc["id"], doc["digest"]) for doc in [requirement, *offers]])
+        notices = self.documents("notice")
+        return digest([(doc["id"], doc["digest"]) for doc in [requirement, *offers, *notices]])
 
     def approve(self, analysis_id: int, expected_input_digest: str) -> dict[str, Any]:
         with self.transaction():

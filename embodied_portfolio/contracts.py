@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 import json
@@ -58,6 +59,24 @@ def identifiers(value: Any, name: str, *, empty: bool = False) -> tuple[str, ...
 
 def canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def day(value: Any, name: str) -> str:
+    """只接受 ISO 日历日期，避免依赖运行时区域设置。"""
+    if not isinstance(value, str) or not DAY.fullmatch(value):
+        raise PortfolioError("invalid_date", f"{name} must be YYYY-MM-DD")
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise PortfolioError("invalid_date", f"{name} is not a calendar date") from None
+    return value
+
+
+def optional_day(value: Any, name: str) -> str | None:
+    return None if value is None else day(value, name)
 
 
 PATHS = {"teleoperation", "simulation", "portable", "internet"}
@@ -236,9 +255,67 @@ class Requirement:
                 "allowed_paths": list(self.allowed_paths), "maximum_packages": self.maximum_packages}
 
 
-def parse_document(kind: str, value: Any) -> Offer | Requirement:
+NOTICE_STATUSES = {"terminated", "withdrawn"}
+
+
+@dataclass(frozen=True)
+class Notice:
+    """法务授权通知。只追加，不修改；撤回也必须作为独立通知登记。"""
+
+    notice: str
+    package: str
+    status: str
+    effective_on: str
+    grace_until: str | None
+    grace_conditions: str | None
+    reference: str
+    supersedes: str | None
+    notes: str
+
+    @classmethod
+    def parse(cls, value: Any) -> "Notice":
+        if not isinstance(value, dict):
+            raise PortfolioError("notice_shape", "notice must be an object")
+        status = value.get("status")
+        if status not in NOTICE_STATUSES:
+            raise PortfolioError("notice_status", "status must be terminated or withdrawn")
+        effective_on = day(value.get("effective_on"), "effective_on")
+        grace_until = optional_day(value.get("grace_until"), "grace_until")
+        if grace_until is not None and grace_until < effective_on:
+            raise PortfolioError("notice_grace", "grace_until cannot precede effective_on")
+        raw_conditions = value.get("grace_conditions")
+        grace_conditions = None
+        if raw_conditions is not None:
+            grace_conditions = text(raw_conditions, "grace_conditions", 300)
+            if grace_until is None:
+                raise PortfolioError("notice_grace", "grace_conditions requires grace_until")
+        supersedes = value.get("supersedes")
+        if supersedes is not None:
+            supersedes = key(supersedes, "supersedes")
+        if status == "withdrawn":
+            if supersedes is None:
+                raise PortfolioError("notice_supersedes", "withdrawal must name the notice it withdraws")
+            if grace_until is not None:
+                raise PortfolioError("notice_grace", "withdrawal cannot grant grace")
+        notes = value.get("notes", "")
+        if not isinstance(notes, str) or len(notes) > 500:
+            raise PortfolioError("notes", "notes must be short text")
+        return cls(key(value.get("notice"), "notice"), key(value.get("package"), "package"),
+                   status, effective_on, grace_until, grace_conditions,
+                   text(value.get("reference"), "reference"), supersedes, notes)
+
+    def document(self) -> dict[str, Any]:
+        return {"notice": self.notice, "package": self.package, "status": self.status,
+                "effective_on": self.effective_on, "grace_until": self.grace_until,
+                "grace_conditions": self.grace_conditions, "reference": self.reference,
+                "supersedes": self.supersedes, "notes": self.notes}
+
+
+def parse_document(kind: str, value: Any) -> Offer | Requirement | "Notice":
     if kind == "offer":
         return Offer.parse(value)
     if kind == "requirement":
         return Requirement.parse(value)
-    raise PortfolioError("document_kind", "kind must be offer or requirement")
+    if kind == "notice":
+        return Notice.parse(value)
+    raise PortfolioError("document_kind", "kind must be offer, requirement or notice")

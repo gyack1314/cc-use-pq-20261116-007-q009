@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 import json
 
-from .contracts import Offer, Requirement, PortfolioError, parse_document
+from .contracts import Notice, Offer, Requirement, PortfolioError, parse_document
 from .ledger import Ledger
 
 
@@ -33,13 +33,41 @@ class Catalog:
         requirement = Requirement.parse(value)
         return self.ledger.insert_document("requirement", requirement.key, requirement.document())
 
+    def _prepare_notice(self, body: dict[str, Any]) -> dict[str, Any]:
+        """把通知固定到当前报价修订，并校验撤回链；单条与批量导入共用。"""
+        notice = Notice.parse(body)
+        offer = self.ledger.latest_document("offer", notice.package)
+        if offer is None:
+            raise PortfolioError("unknown_offer", "notice package is not in catalog")
+        if notice.status == "withdrawn":
+            target = self.ledger.latest_document("notice", notice.supersedes or "")
+            if target is None:
+                raise PortfolioError("unknown_notice", "withdrawn notice is not registered")
+            if target["body"]["status"] != "terminated":
+                raise PortfolioError("notice_supersedes", "only a termination can be withdrawn")
+            if target["body"]["package"] != notice.package:
+                raise PortfolioError("notice_package", "withdrawal must name the same package")
+            if notice.effective_on < target["body"]["effective_on"]:
+                raise PortfolioError("notice_withdrawal_date",
+                                     "withdrawal cannot take effect before the termination")
+        result = notice.document()
+        result["basis"] = {"offer_revision": offer["revision"], "offer_digest": offer["digest"]}
+        return result
+
+    def import_notice(self, value: dict[str, Any]) -> dict[str, Any]:
+        notice = Notice.parse(value)
+        body = self._prepare_notice(value)
+        return self.ledger.insert_document("notice", notice.notice, body)
+
     def import_file(self, kind: str, path: str | Path) -> dict[str, Any]:
         value = read_json(path)
         if kind == "offer":
             return self.import_offer(value)
         if kind == "requirement":
             return self.import_requirement(value)
-        raise PortfolioError("document_kind", "kind must be offer or requirement")
+        if kind == "notice":
+            return self.import_notice(value)
+        raise PortfolioError("document_kind", "kind must be offer, requirement or notice")
 
     def import_batch(self, value: dict[str, Any]) -> dict[str, Any]:
         """整批校验完成后才写入任何修订。"""
@@ -55,9 +83,18 @@ class Catalog:
             kind = item.get("kind")
             parsed = parse_document(kind, item["body"])
             document = parsed.document()
-            identity = parsed.package if isinstance(parsed, Offer) else parsed.key
+            if isinstance(parsed, Offer):
+                identity = parsed.package
+            elif isinstance(parsed, Requirement):
+                identity = parsed.key
+            else:
+                identity = parsed.notice
             entries.append((kind, identity, document))
-        imported = self.ledger.insert_documents(entries)
+
+        def prepare(kind: str, key: str, body: dict[str, Any]) -> dict[str, Any]:
+            return self._prepare_notice(body) if kind == "notice" else body
+
+        imported = self.ledger.insert_documents(entries, prepare=prepare)
         return {"count": len(imported), "changed": sum(doc["changed"] for doc in imported),
                 "documents": [{"kind": doc["kind"], "key": doc["key"],
                                "revision": doc["revision"], "changed": doc["changed"]}
@@ -75,8 +112,11 @@ class Catalog:
             raise PortfolioError("missing_requirement", f"requirement {key} not found")
         return doc, Requirement.parse(doc["body"])
 
+    def notices(self) -> list[dict[str, Any]]:
+        return self.ledger.documents("notice")
+
     def history(self, kind: str, key: str) -> list[dict[str, Any]]:
-        if kind not in {"offer", "requirement"}:
+        if kind not in {"offer", "requirement", "notice"}:
             raise PortfolioError("document_kind", "unknown document kind")
         return [doc for doc in self.ledger.documents(kind, latest=False) if doc["key"] == key]
 
@@ -84,6 +124,7 @@ class Catalog:
         offers = self.ledger.documents("offer")
         requirements = self.ledger.documents("requirement")
         return {"offer_count": len(offers), "requirement_count": len(requirements),
+                "notice_count": len(self.ledger.documents("notice")),
                 "offer_versions": sum(len(self.history("offer", item["key"])) for item in offers),
                 "requirement_versions": sum(len(self.history("requirement", item["key"])) for item in requirements)}
 

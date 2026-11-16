@@ -48,11 +48,17 @@ class PortfolioOptimizer:
         self.prices = prices
         self.maximum_candidates = maximum_candidates
 
-    def eligible(self, requirement: Requirement, offers: list[Offer]) -> tuple[list[Offer], list[dict[str, str]]]:
+    def eligible(self, requirement: Requirement, offers: list[Offer],
+                 unavailable: dict[str, str] | None = None) -> tuple[list[Offer], list[dict[str, str]]]:
         eligible = []
         filtered = []
+        unavailable = unavailable or {}
         target_tokens = {target.slice.token() for target in requirement.targets}
         for offer in offers:
+            if offer.package in unavailable:
+                filtered.append({"package": offer.package,
+                                 "reason": unavailable[offer.package] or "not_available"})
+                continue
             quote = self.prices.quote(offer, requirement)
             if not quote.permitted:
                 filtered.append({"package": offer.package, "reason": quote.reason or "not_permitted"})
@@ -77,8 +83,9 @@ class PortfolioOptimizer:
         return (-Decimal(candidate.score), Decimal(candidate.cost),
                 candidate.duplicates, len(candidate.packages), candidate.packages)
 
-    def search(self, requirement: Requirement, offers: list[Offer]) -> SearchResult:
-        eligible, filtered = self.eligible(requirement, offers)
+    def search(self, requirement: Requirement, offers: list[Offer],
+               unavailable: dict[str, str] | None = None) -> SearchResult:
+        eligible, filtered = self.eligible(requirement, offers, unavailable)
         if len(eligible) > self.maximum_candidates:
             raise PortfolioError("candidate_limit", f"more than {self.maximum_candidates} eligible offers")
         evaluated = 0
@@ -106,8 +113,9 @@ class PortfolioOptimizer:
         return SearchResult(None, evaluated, 0, tuple(filtered),
                             tuple(affordable[:3]), reason)
 
-    def frontier(self, requirement: Requirement, offers: list[Offer]) -> list[dict[str, Any]]:
-        eligible, _ = self.eligible(requirement, offers)
+    def frontier(self, requirement: Requirement, offers: list[Offer],
+                 unavailable: dict[str, str] | None = None) -> list[dict[str, Any]]:
+        eligible, _ = self.eligible(requirement, offers, unavailable)
         if len(eligible) > self.maximum_candidates:
             raise PortfolioError("candidate_limit", "too many offers for frontier")
         candidates = []
@@ -130,7 +138,9 @@ class PortfolioOptimizer:
         return [item.document() for item in frontier]
 
     def exclusion_analysis(self, requirement: Requirement, offers: list[Offer],
-                           chosen: list[Offer]) -> list[dict[str, Any]]:
+                           chosen: list[Offer],
+                           unavailable: dict[str, str] | None = None) -> list[dict[str, Any]]:
+        unavailable = unavailable or {}
         chosen_keys = {offer.package for offer in chosen}
         baseline = self.evaluate(requirement, chosen)
         explanations = []
@@ -138,7 +148,10 @@ class PortfolioOptimizer:
             if offer.package in chosen_keys:
                 continue
             quote = self.prices.quote(offer, requirement)
-            if not quote.permitted:
+            if offer.package in unavailable:
+                reason = unavailable[offer.package] or "not_available"
+                gain = None
+            elif not quote.permitted:
                 reason = quote.reason
                 gain = None
             else:
